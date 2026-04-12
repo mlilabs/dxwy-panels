@@ -4,12 +4,18 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "${workspaceFolder}/../../build-netztester2/build/linux-custom/include/",
-                "${workspaceFolder}/../../build-netztester2/build/linux-custom/arch/arm64/include/",
-                "${workspaceFolder}/../../build-netztester2/build/linux-custom/arch/arm64/include/generated",
-                "${workspaceFolder}/../../build-netztester2/build/linux-custom/arch/arm64/mach-s3c24xx/include"
+                "${env:HOME}/raumscan-os/build-raumscan1/build/linux-custom/include/",
+                "${env:HOME}/raumscan-os/build-raumscan1/build/linux-custom/include/uapi/",
+                "${env:HOME}/raumscan-os/build-raumscan1/build/linux-custom/include/generated/",
+                "${env:HOME}/raumscan-os/build-raumscan1/build/linux-custom/arch/arm64/include/",
+                "${env:HOME}/raumscan-os/build-raumscan1/build/linux-custom/arch/arm64/include/generated/",
+                "${env:HOME}/raumscan-os/build-raumscan1/build/linux-custom/arch/arm64/include/uapi/"
             ],
-            "defines": [],
+            "defines": [
+                "__KERNEL__",
+                "MODULE",
+                "__linux__"
+            ],
             "cStandard": "c11",
             "intelliSenseMode": "gcc-arm64"
         }
