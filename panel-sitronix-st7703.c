@@ -377,7 +377,7 @@ static int d500c2523v0_init_sequence(struct st7703 *ctx)
 			  0x10, 0x10, 0x28, 0x28, 0x03, 0xFF, 0x00, 0x00,
 			  0x00, 0x00);
 	dsi_dcs_write_seq(dsi, ST7703_CMD_SETCYC, 0x80);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETBGP, 0x0A, 0x0A);
+	dsi_dcs_write_seq(dsi, ST7703_CMD_SETBGP, 0x0C, 0x0C);
 	dsi_dcs_write_seq(dsi, ST7703_CMD_SETVCOM, 0x7D, 0x7D);
 	dsi_dcs_write_seq(dsi, ST7703_CMD_SETPOWER_EXT,
 			  0x26, 0x22, 0xF0, 0x13);
