@@ -11,12 +11,16 @@
 
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/fs.h>
 #include <linux/gpio/consumer.h>
 #include <linux/media-bus-format.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/regulator/consumer.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
 
 #include <video/display_timing.h>
 #include <video/mipi_display.h>
@@ -648,12 +652,102 @@ static int allpixelson_set(void *data, u64 val)
 DEFINE_SIMPLE_ATTRIBUTE(allpixelson_fops, NULL,
 			allpixelson_set, "%llu\n");
 
+static int st7703_push_dcs(struct st7703 *ctx, u8 cmd,
+			   const u8 *payload, size_t len)
+{
+	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+	static const u8 setextc[] = { 0xF1, 0x12, 0x83 };
+	int ret;
+
+	ret = mipi_dsi_dcs_write(dsi, ST7703_CMD_SETEXTC,
+				 setextc, sizeof(setextc));
+	if (ret < 0) {
+		dev_err(ctx->dev, "SETEXTC failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = mipi_dsi_dcs_write(dsi, cmd, payload, len);
+	if (ret < 0) {
+		dev_err(ctx->dev, "DCS cmd 0x%02x (%zu bytes) failed: %d\n",
+			cmd, len, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static ssize_t st7703_tune_write(struct st7703 *ctx, u8 cmd, size_t expected,
+				 const char __user *ubuf, size_t count)
+{
+	u8 payload[34];
+	int ret;
+
+	if (expected > sizeof(payload))
+		return -EINVAL;
+	if (count != expected)
+		return -EINVAL;
+
+	if (copy_from_user(payload, ubuf, expected))
+		return -EFAULT;
+
+	ret = st7703_push_dcs(ctx, cmd, payload, expected);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static ssize_t gamma_write(struct file *f, const char __user *ubuf,
+			   size_t count, loff_t *ppos)
+{
+	return st7703_tune_write(f->private_data, ST7703_CMD_SETGAMMA, 34,
+				 ubuf, count);
+}
+
+static ssize_t bgp_write(struct file *f, const char __user *ubuf,
+			 size_t count, loff_t *ppos)
+{
+	return st7703_tune_write(f->private_data, ST7703_CMD_SETBGP, 2,
+				 ubuf, count);
+}
+
+static ssize_t vcom_write(struct file *f, const char __user *ubuf,
+			  size_t count, loff_t *ppos)
+{
+	return st7703_tune_write(f->private_data, ST7703_CMD_SETVCOM, 2,
+				 ubuf, count);
+}
+
+static const struct file_operations gamma_fops = {
+	.owner = THIS_MODULE,
+	.open  = simple_open,
+	.write = gamma_write,
+	.llseek = noop_llseek,
+};
+
+static const struct file_operations bgp_fops = {
+	.owner = THIS_MODULE,
+	.open  = simple_open,
+	.write = bgp_write,
+	.llseek = noop_llseek,
+};
+
+static const struct file_operations vcom_fops = {
+	.owner = THIS_MODULE,
+	.open  = simple_open,
+	.write = vcom_write,
+	.llseek = noop_llseek,
+};
+
 static void st7703_debugfs_init(struct st7703 *ctx)
 {
 	ctx->debugfs = debugfs_create_dir(DRV_NAME, NULL);
 
 	debugfs_create_file("allpixelson", 0600, ctx->debugfs, ctx,
 			    &allpixelson_fops);
+	debugfs_create_file("gamma", 0200, ctx->debugfs, ctx, &gamma_fops);
+	debugfs_create_file("bgp",   0200, ctx->debugfs, ctx, &bgp_fops);
+	debugfs_create_file("vcom",  0200, ctx->debugfs, ctx, &vcom_fops);
 }
 
 static void st7703_debugfs_remove(struct st7703 *ctx)
