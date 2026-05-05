@@ -16,6 +16,7 @@
 #include <linux/media-bus-format.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
@@ -58,6 +59,10 @@
 #define ST7703_CMD_SETCABC	 0xC8
 #define ST7703_CMD_UNKNOWN_EF	 0xEF
 
+#define ST7703_GAMMA_LEN	34
+#define ST7703_BGP_LEN		2
+#define ST7703_VCOM_LEN		2
+
 struct st7703 {
 	struct device *dev;
 	struct drm_panel panel;
@@ -68,6 +73,10 @@ struct st7703 {
 
 	struct dentry *debugfs;
 	const struct st7703_panel_desc *desc;
+
+	u8 gamma[ST7703_GAMMA_LEN];
+	u8 bgp[ST7703_BGP_LEN];
+	u8 vcom[ST7703_VCOM_LEN];
 };
 
 struct st7703_panel_desc {
@@ -76,6 +85,10 @@ struct st7703_panel_desc {
 	unsigned long mode_flags;
 	enum mipi_dsi_pixel_format format;
 	int (*init_sequence)(struct st7703 *ctx);
+
+	u8 gamma[ST7703_GAMMA_LEN];
+	u8 bgp[ST7703_BGP_LEN];
+	u8 vcom[ST7703_VCOM_LEN];
 };
 
 static inline struct st7703 *panel_to_st7703(struct drm_panel *panel)
@@ -83,44 +96,110 @@ static inline struct st7703 *panel_to_st7703(struct drm_panel *panel)
 	return container_of(panel, struct st7703, panel);
 }
 
-#define dsi_generic_write_seq(dsi, seq...) do {				\
+#define ST7703_DSI_RETRIES	10
+#define ST7703_DSI_RETRY_DELAY_MS	100
+
+static bool st7703_dsi_err_is_transient(int err)
+{
+	return err == -ETIMEDOUT || err == -EIO || err == -EAGAIN;
+}
+
+static int st7703_dcs_write(struct st7703 *ctx, u8 cmd,
+			    const void *data, size_t len)
+{
+	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+	int ret = 0;
+	int attempt;
+
+	for (attempt = 0; attempt < ST7703_DSI_RETRIES; attempt++) {
+		ret = mipi_dsi_dcs_write(dsi, cmd, data, len);
+		if (ret >= 0)
+			return ret;
+		if (!st7703_dsi_err_is_transient(ret))
+			return ret;
+		dev_warn_ratelimited(ctx->dev,
+			"DCS cmd 0x%02x (%zu bytes) transient err %d, retry %d/%d\n",
+			cmd, len, ret, attempt + 1, ST7703_DSI_RETRIES);
+		msleep(ST7703_DSI_RETRY_DELAY_MS);
+	}
+
+	return ret;
+}
+
+static int st7703_generic_write(struct st7703 *ctx,
+				const void *data, size_t len)
+{
+	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+	int ret = 0;
+	int attempt;
+
+	for (attempt = 0; attempt < ST7703_DSI_RETRIES; attempt++) {
+		ret = mipi_dsi_generic_write(dsi, data, len);
+		if (ret >= 0)
+			return ret;
+		if (!st7703_dsi_err_is_transient(ret))
+			return ret;
+		dev_warn_ratelimited(ctx->dev,
+			"generic write (%zu bytes) transient err %d, retry %d/%d\n",
+			len, ret, attempt + 1, ST7703_DSI_RETRIES);
+		msleep(ST7703_DSI_RETRY_DELAY_MS);
+	}
+
+	return ret;
+}
+
+#define dsi_generic_write_seq(ctx, seq...) do {				\
 		static const u8 d[] = { seq };				\
-		int ret;						\
-		ret = mipi_dsi_generic_write(dsi, d, ARRAY_SIZE(d));	\
-		if (ret < 0)						\
-			return ret;					\
+		int _r;							\
+		_r = st7703_generic_write(ctx, d, ARRAY_SIZE(d));	\
+		if (_r < 0)						\
+			return _r;					\
 	} while (0)
+
+#define dsi_dcs_write_seq(ctx, cmd, seq...) do {			\
+		static const u8 d[] = { seq };				\
+		int _r;							\
+		_r = st7703_dcs_write(ctx, cmd, d, ARRAY_SIZE(d));	\
+		if (_r < 0)						\
+			return _r;					\
+	} while (0)
+
+#define st7703_write_calib(ctx, cmd, field) do {			\
+		int _r = st7703_dcs_write(ctx, cmd, (ctx)->field,	\
+					  sizeof((ctx)->field));	\
+		if (_r < 0)						\
+			return _r;					\
+	} while (0)
+
 
 static int jh057n_init_sequence(struct st7703 *ctx)
 {
-	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
-
 	/*
 	 * Init sequence was supplied by the panel vendor. Most of the commands
 	 * resemble the ST7703 but the number of parameters often don't match
 	 * so it's likely a clone.
 	 */
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETEXTC,
+	dsi_generic_write_seq(ctx, ST7703_CMD_SETEXTC,
 			      0xF1, 0x12, 0x83);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETRGBIF,
+	dsi_generic_write_seq(ctx, ST7703_CMD_SETRGBIF,
 			      0x10, 0x10, 0x05, 0x05, 0x03, 0xFF, 0x00, 0x00,
 			      0x00, 0x00);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETSCR,
+	dsi_generic_write_seq(ctx, ST7703_CMD_SETSCR,
 			      0x73, 0x73, 0x50, 0x50, 0x00, 0x00, 0x08, 0x70,
 			      0x00);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETVDC, 0x4E);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETPANEL, 0x0B);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETCYC, 0x80);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETDISP, 0xF0, 0x12, 0x30);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETEQ,
+	dsi_generic_write_seq(ctx, ST7703_CMD_SETVDC, 0x4E);
+	dsi_generic_write_seq(ctx, ST7703_CMD_SETPANEL, 0x0B);
+	dsi_generic_write_seq(ctx, ST7703_CMD_SETCYC, 0x80);
+	dsi_generic_write_seq(ctx, ST7703_CMD_SETDISP, 0xF0, 0x12, 0x30);
+	dsi_generic_write_seq(ctx, ST7703_CMD_SETEQ,
 			      0x07, 0x07, 0x0B, 0x0B, 0x03, 0x0B, 0x00, 0x00,
 			      0x00, 0x00, 0xFF, 0x00, 0xC0, 0x10);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETBGP, 0x08, 0x08);
+	st7703_write_calib(ctx, ST7703_CMD_SETBGP, bgp);
 	msleep(20);
 
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETVCOM, 0x3F, 0x3F);
-	dsi_generic_write_seq(dsi, ST7703_CMD_UNKNOWN_BF, 0x02, 0x11, 0x00);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETGIP1,
+	st7703_write_calib(ctx, ST7703_CMD_SETVCOM, vcom);
+	dsi_generic_write_seq(ctx, ST7703_CMD_UNKNOWN_BF, 0x02, 0x11, 0x00);
+	dsi_generic_write_seq(ctx, ST7703_CMD_SETGIP1,
 			      0x82, 0x10, 0x06, 0x05, 0x9E, 0x0A, 0xA5, 0x12,
 			      0x31, 0x23, 0x37, 0x83, 0x04, 0xBC, 0x27, 0x38,
 			      0x0C, 0x00, 0x03, 0x00, 0x00, 0x00, 0x0C, 0x00,
@@ -129,7 +208,7 @@ static int jh057n_init_sequence(struct st7703 *ctx)
 			      0x64, 0x20, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88,
 			      0x02, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETGIP2,
+	dsi_generic_write_seq(ctx, ST7703_CMD_SETGIP2,
 			      0x02, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			      0x00, 0x00, 0x00, 0x00, 0x02, 0x46, 0x02, 0x88,
 			      0x88, 0x88, 0x88, 0x88, 0x88, 0x64, 0x88, 0x13,
@@ -138,12 +217,7 @@ static int jh057n_init_sequence(struct st7703 *ctx)
 			      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x0A,
 			      0xA5, 0x00, 0x00, 0x00, 0x00);
-	dsi_generic_write_seq(dsi, ST7703_CMD_SETGAMMA,
-			      0x00, 0x09, 0x0E, 0x29, 0x2D, 0x3C, 0x41, 0x37,
-			      0x07, 0x0B, 0x0D, 0x10, 0x11, 0x0F, 0x10, 0x11,
-			      0x18, 0x00, 0x09, 0x0E, 0x29, 0x2D, 0x3C, 0x41,
-			      0x37, 0x07, 0x0B, 0x0D, 0x10, 0x11, 0x0F, 0x10,
-			      0x11, 0x18);
+	st7703_write_calib(ctx, ST7703_CMD_SETGAMMA, gamma);
 
 	return 0;
 }
@@ -170,29 +244,26 @@ static const struct st7703_panel_desc jh057n00900_panel_desc = {
 		MIPI_DSI_MODE_VIDEO_BURST | MIPI_DSI_MODE_VIDEO_SYNC_PULSE,
 	.format = MIPI_DSI_FMT_RGB888,
 	.init_sequence = jh057n_init_sequence,
+	.bgp   = { 0x08, 0x08 },
+	.vcom  = { 0x3F, 0x3F },
+	.gamma = { 0x00, 0x09, 0x0E, 0x29, 0x2D, 0x3C, 0x41, 0x37,
+		   0x07, 0x0B, 0x0D, 0x10, 0x11, 0x0F, 0x10, 0x11,
+		   0x18, 0x00, 0x09, 0x0E, 0x29, 0x2D, 0x3C, 0x41,
+		   0x37, 0x07, 0x0B, 0x0D, 0x10, 0x11, 0x0F, 0x10,
+		   0x11, 0x18 },
 };
-
-#define dsi_dcs_write_seq(dsi, cmd, seq...) do {			\
-		static const u8 d[] = { seq };				\
-		int ret;						\
-		ret = mipi_dsi_dcs_write(dsi, cmd, d, ARRAY_SIZE(d));	\
-		if (ret < 0)						\
-			return ret;					\
-	} while (0)
 
 
 static int xbd599_init_sequence(struct st7703 *ctx)
 {
-	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
-
 	/*
 	 * Init sequence was supplied by the panel vendor.
 	 */
 
 	/* Magic sequence to unlock user commands below. */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETEXTC, 0xF1, 0x12, 0x83);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETEXTC, 0xF1, 0x12, 0x83);
 
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETMIPI,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETMIPI,
 			  0x33, /* VC_main = 0, Lane_Number = 3 (4 lanes) */
 			  0x81, /* DSI_LDO_SEL = 1.7V, RTERM = 90 Ohm */
 			  0x05, /* IHSRX = x6 (Low High Speed driving ability) */
@@ -204,14 +275,14 @@ static int xbd599_init_sequence(struct st7703 *ctx)
 			  0x44, 0x25, 0x00, 0x91, 0x0a, 0x00, 0x00, 0x02,
 			  0x4F, 0x11, 0x00, 0x00, 0x37);
 
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETPOWER_EXT,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETPOWER_EXT,
 			  0x25, /* PCCS = 2, ECP_DC_DIV = 1/4 HSYNC */
 			  0x22, /* DT = 15ms XDK_ECP = x2 */
 			  0x20, /* PFM_DC_DIV = /1 */
 			  0x03  /* ECP_SYNC_EN = 1, VGX_SYNC_EN = 1 */);
 
 	/* RGB I/F porch timing */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETRGBIF,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETRGBIF,
 			  0x10, /* VBP_RGB_GEN */
 			  0x10, /* VFP_RGB_GEN */
 			  0x05, /* DE_BP_RGB_GEN */
@@ -222,7 +293,7 @@ static int xbd599_init_sequence(struct st7703 *ctx)
 			  0x00, 0x00);
 
 	/* Source driving settings. */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETSCR,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETSCR,
 			  0x73, /* N_POPON */
 			  0x73, /* N_NOPON */
 			  0x50, /* I_POPON */
@@ -234,19 +305,19 @@ static int xbd599_init_sequence(struct st7703 *ctx)
 			  0x00  /* Undocumented */);
 
 	/* NVDDD_SEL = -1.8V, VDDD_SEL = out of range (possibly 1.9V?) */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETVDC, 0x4E);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETVDC, 0x4E);
 
 	/*
 	 * SS_PANEL = 1 (reverse scan), GS_PANEL = 0 (normal scan)
 	 * REV_PANEL = 1 (normally black panel), BGR_PANEL = 1 (BGR)
 	 */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETPANEL, 0x0B);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETPANEL, 0x0B);
 
 	/* Zig-Zag Type C column inversion. */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETCYC, 0x80);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETCYC, 0x80);
 
 	/* Set display resolution. */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETDISP,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETDISP,
 			  0xF0, /* NL = 240 */
 			  0x12, /* RES_V_LSB = 0, BLK_CON = VSSD,
 				 * RESO_SEL = 720RGB
@@ -256,7 +327,7 @@ static int xbd599_init_sequence(struct st7703 *ctx)
 				 * ISC = 0 frames
 				 */);
 
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETEQ,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETEQ,
 			  0x00, /* PNOEQ */
 			  0x00, /* NNOEQ */
 			  0x0B, /* PEQGND */
@@ -277,9 +348,9 @@ static int xbd599_init_sequence(struct st7703 *ctx)
 				 */);
 
 	/* Undocumented command. */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_UNKNOWN_C6, 0x01, 0x00, 0xFF, 0xFF, 0x00);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_UNKNOWN_C6, 0x01, 0x00, 0xFF, 0xFF, 0x00);
 
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETPOWER,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETPOWER,
 			  0x74, /* VBTHS, VBTLS: VGH = 17V, VBL = -11V */
 			  0x00, /* FBOFF_VGH = 0, FBOFF_VGL = 0 */
 			  0x32, /* VRP  */
@@ -297,20 +368,16 @@ static int xbd599_init_sequence(struct st7703 *ctx)
 			  0x77  /* VGH3_R_DIV, VGL3_R_DIV (4.5MHz) */);
 
 	/* Reference voltage. */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETBGP,
-			  0x07, /* VREF_SEL = 4.2V */
-			  0x07  /* NVREF_SEL = 4.2V */);
+	st7703_write_calib(ctx, ST7703_CMD_SETBGP, bgp);
 	msleep(20);
 
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETVCOM,
-			  0x2C, /* VCOMDC_F = -0.67V */
-			  0x2C  /* VCOMDC_B = -0.67V */);
+	st7703_write_calib(ctx, ST7703_CMD_SETVCOM, vcom);
 
 	/* Undocumented command. */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_UNKNOWN_BF, 0x02, 0x11, 0x00);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_UNKNOWN_BF, 0x02, 0x11, 0x00);
 
 	/* This command is to set forward GIP timing. */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETGIP1,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETGIP1,
 			  0x82, 0x10, 0x06, 0x05, 0xA2, 0x0A, 0xA5, 0x12,
 			  0x31, 0x23, 0x37, 0x83, 0x04, 0xBC, 0x27, 0x38,
 			  0x0C, 0x00, 0x03, 0x00, 0x00, 0x00, 0x0C, 0x00,
@@ -321,7 +388,7 @@ static int xbd599_init_sequence(struct st7703 *ctx)
 			  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
 
 	/* This command is to set backward GIP timing. */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETGIP2,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETGIP2,
 			  0x02, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			  0x00, 0x00, 0x00, 0x00, 0x02, 0x46, 0x02, 0x88,
 			  0x88, 0x88, 0x88, 0x88, 0x88, 0x64, 0x88, 0x13,
@@ -332,12 +399,7 @@ static int xbd599_init_sequence(struct st7703 *ctx)
 			  0xA5, 0x00, 0x00, 0x00, 0x00);
 
 	/* Adjust the gamma characteristics of the panel. */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETGAMMA,
-			  0x00, 0x09, 0x0D, 0x23, 0x27, 0x3C, 0x41, 0x35,
-			  0x07, 0x0D, 0x0E, 0x12, 0x13, 0x10, 0x12, 0x12,
-			  0x18, 0x00, 0x09, 0x0D, 0x23, 0x27, 0x3C, 0x41,
-			  0x35, 0x07, 0x0D, 0x0E, 0x12, 0x13, 0x10, 0x12,
-			  0x12, 0x18);
+	st7703_write_calib(ctx, ST7703_CMD_SETGAMMA, gamma);
 
 	return 0;
 }
@@ -363,6 +425,13 @@ static const struct st7703_panel_desc xbd599_desc = {
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE,
 	.format = MIPI_DSI_FMT_RGB888,
 	.init_sequence = xbd599_init_sequence,
+	.bgp   = { 0x07, 0x07 }, /* VREF/NVREF = 4.2V */
+	.vcom  = { 0x2C, 0x2C }, /* VCOMDC = -0.67V */
+	.gamma = { 0x00, 0x09, 0x0D, 0x23, 0x27, 0x3C, 0x41, 0x35,
+		   0x07, 0x0D, 0x0E, 0x12, 0x13, 0x10, 0x12, 0x12,
+		   0x18, 0x00, 0x09, 0x0D, 0x23, 0x27, 0x3C, 0x41,
+		   0x35, 0x07, 0x0D, 0x0E, 0x12, 0x13, 0x10, 0x12,
+		   0x12, 0x18 },
 };
 
 static int d500c2523v0_init_sequence(struct st7703 *ctx)
@@ -373,17 +442,17 @@ static int d500c2523v0_init_sequence(struct st7703 *ctx)
 	 * Init sequence was supplied by the panel vendor for the
 	 * DXWY D500C2523V0 5.0" 720x1280 panel with ST7703 controller.
 	 */
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETEXTC, 0xF1, 0x12, 0x83);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETAPID,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETEXTC, 0xF1, 0x12, 0x83);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETAPID,
 			  0x00, 0x00, 0x00, 0xDA, 0x80);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETDISP, 0xC8, 0x02, 0x70);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETRGBIF,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETDISP, 0xC8, 0x02, 0x70);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETRGBIF,
 			  0x10, 0x10, 0x28, 0x28, 0x03, 0xFF, 0x00, 0x00,
 			  0x00, 0x00);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETCYC, 0x80);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETBGP, 0x0C, 0x0C);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETVCOM, 0x7D, 0x7D);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETPOWER_EXT,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETCYC, 0x80);
+	st7703_write_calib(ctx, ST7703_CMD_SETBGP, bgp);
+	st7703_write_calib(ctx, ST7703_CMD_SETVCOM, vcom);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETPOWER_EXT,
 			  0x26, 0x22, 0xF0, 0x13);
 
 	/* Configure DSI lanes: 0x31 = 2 lanes, 0x33 = 4 lanes. */
@@ -399,37 +468,32 @@ static int d500c2523v0_init_sequence(struct st7703 *ctx)
 		if (dsi->lanes == 4)
 			setmipi[0] = 0x33;
 
-		ret = mipi_dsi_dcs_write(dsi, ST7703_CMD_SETMIPI,
-					 setmipi, sizeof(setmipi));
+		ret = st7703_dcs_write(ctx, ST7703_CMD_SETMIPI,
+				       setmipi, sizeof(setmipi));
 		if (ret < 0)
 			return ret;
 	}
 
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETVDC, 0x47);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_UNKNOWN_BF, 0x02, 0x11, 0x00);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETSCR,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETVDC, 0x47);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_UNKNOWN_BF, 0x02, 0x11, 0x00);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETSCR,
 			  0x73, 0x73, 0x50, 0x50, 0x00, 0x00, 0x12, 0x70,
 			  0x00);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETPOWER,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETPOWER,
 			  0x25, 0x00, 0x32, 0x32, 0x77, 0xE4, 0xFF, 0xFF,
 			  0xCC, 0xCC, 0x77, 0x77);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_UNKNOWN_C6,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_UNKNOWN_C6,
 			  0x82, 0x00, 0xBF, 0xFF, 0x00, 0xFF);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETIO,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETIO,
 			  0xB8, 0x00, 0x0A, 0x10, 0x01, 0x09);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETCABC,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETCABC,
 			  0x10, 0x40, 0x1E, 0x02);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETPANEL, 0x0B);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETGAMMA,
-			  0x08, 0x09, 0x09, 0x30, 0x30, 0x3F, 0x2D, 0x28,
-			  0x05, 0x09, 0x0C, 0x10, 0x12, 0x10, 0x12, 0x0F,
-			  0x18, 0x00, 0x09, 0x09, 0x30, 0x30, 0x3F, 0x2D,
-			  0x28, 0x05, 0x09, 0x0C, 0x10, 0x12, 0x10, 0x12,
-			  0x0F, 0x18);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETEQ,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETPANEL, 0x0B);
+	st7703_write_calib(ctx, ST7703_CMD_SETGAMMA, gamma);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETEQ,
 			  0x07, 0x07, 0x0B, 0x0B, 0x0B, 0x0B, 0x00, 0x00,
 			  0x00, 0x00, 0xFF, 0x80, 0xC0, 0x10);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETGIP1,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETGIP1,
 			  0xC8, 0x10, 0x0C, 0x00, 0x00, 0x80, 0x81, 0x12,
 			  0x31, 0x23, 0x4F, 0x8A, 0x80, 0x38, 0x47, 0x18,
 			  0x30, 0x00, 0x01, 0x00, 0x00, 0x00, 0x30, 0x00,
@@ -438,7 +502,7 @@ static int d500c2523v0_init_sequence(struct st7703 *ctx)
 			  0x13, 0x57, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88,
 			  0xFF, 0x13, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
 			  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_SETGIP2,
+	dsi_dcs_write_seq(ctx, ST7703_CMD_SETGIP2,
 			  0x00, 0x1A, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
 			  0x00, 0x00, 0x00, 0x00, 0x9F, 0x75, 0x31, 0x88,
 			  0x88, 0x88, 0x88, 0x88, 0x88, 0xF8, 0x31, 0x9F,
@@ -447,7 +511,7 @@ static int d500c2523v0_init_sequence(struct st7703 *ctx)
 			  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			  0x00, 0x00, 0x05, 0x0D, 0x00, 0x00, 0x00, 0x00,
 			  0x00, 0x70, 0x80, 0x81, 0x00);
-	dsi_dcs_write_seq(dsi, ST7703_CMD_UNKNOWN_EF, 0xFF, 0xFF, 0x01);
+	dsi_dcs_write_seq(ctx, ST7703_CMD_UNKNOWN_EF, 0xFF, 0xFF, 0x01);
 
 	return 0;
 }
@@ -474,6 +538,13 @@ static const struct st7703_panel_desc d500c2523v0_desc = {
 		      MIPI_DSI_MODE_LPM | MIPI_DSI_CLOCK_NON_CONTINUOUS,
 	.format = MIPI_DSI_FMT_RGB888,
 	.init_sequence = d500c2523v0_init_sequence,
+	.bgp   = { 0x0C, 0x0C },
+	.vcom  = { 0x7D, 0x7D },
+	.gamma = { 0x08, 0x09, 0x09, 0x30, 0x30, 0x3F, 0x2D, 0x28,
+		   0x05, 0x09, 0x0C, 0x10, 0x12, 0x10, 0x12, 0x0F,
+		   0x18, 0x00, 0x09, 0x09, 0x30, 0x30, 0x3F, 0x2D,
+		   0x28, 0x05, 0x09, 0x0C, 0x10, 0x12, 0x10, 0x12,
+		   0x0F, 0x18 },
 };
 
 static int st7703_enable(struct drm_panel *panel)
@@ -635,10 +706,9 @@ static const struct drm_panel_funcs st7703_drm_funcs = {
 static int allpixelson_set(void *data, u64 val)
 {
 	struct st7703 *ctx = data;
-	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
 
 	dev_dbg(ctx->dev, "Setting all pixels on\n");
-	dsi_generic_write_seq(dsi, ST7703_CMD_ALL_PIXEL_ON);
+	dsi_generic_write_seq(ctx, ST7703_CMD_ALL_PIXEL_ON);
 	msleep(val * 1000);
 	/* Reset the panel to get video back */
 	drm_panel_disable(&ctx->panel);
@@ -655,18 +725,17 @@ DEFINE_SIMPLE_ATTRIBUTE(allpixelson_fops, NULL,
 static int st7703_push_dcs(struct st7703 *ctx, u8 cmd,
 			   const u8 *payload, size_t len)
 {
-	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
 	static const u8 setextc[] = { 0xF1, 0x12, 0x83 };
 	int ret;
 
-	ret = mipi_dsi_dcs_write(dsi, ST7703_CMD_SETEXTC,
-				 setextc, sizeof(setextc));
+	ret = st7703_dcs_write(ctx, ST7703_CMD_SETEXTC,
+			       setextc, sizeof(setextc));
 	if (ret < 0) {
 		dev_err(ctx->dev, "SETEXTC failed: %d\n", ret);
 		return ret;
 	}
 
-	ret = mipi_dsi_dcs_write(dsi, cmd, payload, len);
+	ret = st7703_dcs_write(ctx, cmd, payload, len);
 	if (ret < 0) {
 		dev_err(ctx->dev, "DCS cmd 0x%02x (%zu bytes) failed: %d\n",
 			cmd, len, ret);
@@ -756,6 +825,55 @@ static void st7703_debugfs_remove(struct st7703 *ctx)
 	ctx->debugfs = NULL;
 }
 
+static int st7703_read_u8_override(struct device *dev, const char *name,
+				   u8 *buf, size_t expected)
+{
+	int ret;
+
+	if (!of_find_property(dev->of_node, name, NULL))
+		return 0;
+
+	ret = of_property_read_variable_u8_array(dev->of_node, name, buf,
+						 expected, expected);
+	if (ret < 0) {
+		dev_err(dev, "DT property '%s' must be exactly %zu bytes (%d)\n",
+			name, expected, ret);
+		return ret;
+	}
+
+	dev_info(dev, "Using DT override for %s (%zu bytes)\n",
+		 name, expected);
+	return 0;
+}
+
+static int st7703_load_calibration(struct st7703 *ctx)
+{
+	int ret;
+
+	/* Start from the panel descriptor's defaults. */
+	memcpy(ctx->gamma, ctx->desc->gamma, sizeof(ctx->gamma));
+	memcpy(ctx->bgp,   ctx->desc->bgp,   sizeof(ctx->bgp));
+	memcpy(ctx->vcom,  ctx->desc->vcom,  sizeof(ctx->vcom));
+
+	/* Apply DT overrides on top, if any. */
+	ret = st7703_read_u8_override(ctx->dev, "panel,gamma",
+				      ctx->gamma, sizeof(ctx->gamma));
+	if (ret < 0)
+		return ret;
+
+	ret = st7703_read_u8_override(ctx->dev, "panel,bgp",
+				      ctx->bgp, sizeof(ctx->bgp));
+	if (ret < 0)
+		return ret;
+
+	ret = st7703_read_u8_override(ctx->dev, "panel,vcom",
+				      ctx->vcom, sizeof(ctx->vcom));
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
 static int st7703_probe(struct mipi_dsi_device *dsi)
 {
 	struct device *dev = &dsi->dev;
@@ -787,6 +905,10 @@ static int st7703_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx->iovcc))
 		return dev_err_probe(dev, PTR_ERR(ctx->iovcc),
 				     "Failed to request iovcc regulator\n");
+
+	ret = st7703_load_calibration(ctx);
+	if (ret < 0)
+		return ret;
 
 	drm_panel_init(&ctx->panel, dev, &st7703_drm_funcs,
 		       DRM_MODE_CONNECTOR_DSI);
