@@ -16,6 +16,7 @@
 #include <linux/media-bus-format.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/regulator/consumer.h>
@@ -73,6 +74,9 @@ struct st7703 {
 
 	struct dentry *debugfs;
 	const struct st7703_panel_desc *desc;
+
+	/* Serialises runtime calibration updates from debugfs. */
+	struct mutex calib_lock;
 
 	u8 gamma[ST7703_GAMMA_LEN];
 	u8 bgp[ST7703_BGP_LEN];
@@ -722,8 +726,7 @@ static int allpixelson_set(void *data, u64 val)
 DEFINE_SIMPLE_ATTRIBUTE(allpixelson_fops, NULL,
 			allpixelson_set, "%llu\n");
 
-static int st7703_push_dcs(struct st7703 *ctx, u8 cmd,
-			   const u8 *payload, size_t len)
+static int st7703_apply_calibration_locked(struct st7703 *ctx)
 {
 	static const u8 setextc[] = { 0xF1, 0x12, 0x83 };
 	int ret;
@@ -735,31 +738,55 @@ static int st7703_push_dcs(struct st7703 *ctx, u8 cmd,
 		return ret;
 	}
 
-	ret = st7703_dcs_write(ctx, cmd, payload, len);
+	ret = st7703_dcs_write(ctx, ST7703_CMD_SETBGP,
+			       ctx->bgp, sizeof(ctx->bgp));
 	if (ret < 0) {
-		dev_err(ctx->dev, "DCS cmd 0x%02x (%zu bytes) failed: %d\n",
-			cmd, len, ret);
+		dev_err(ctx->dev, "SETBGP failed: %d\n", ret);
+		return ret;
+	}
+	msleep(20);
+
+	ret = st7703_dcs_write(ctx, ST7703_CMD_SETVCOM,
+			       ctx->vcom, sizeof(ctx->vcom));
+	if (ret < 0) {
+		dev_err(ctx->dev, "SETVCOM failed: %d\n", ret);
+		return ret;
+	}
+	msleep(20);
+
+	ret = st7703_dcs_write(ctx, ST7703_CMD_SETGAMMA,
+			       ctx->gamma, sizeof(ctx->gamma));
+	if (ret < 0) {
+		dev_err(ctx->dev, "SETGAMMA failed: %d\n", ret);
 		return ret;
 	}
 
 	return 0;
 }
 
-static ssize_t st7703_tune_write(struct st7703 *ctx, u8 cmd, size_t expected,
-				 const char __user *ubuf, size_t count)
+/*
+ * Stage a new calibration buffer from userspace into the corresponding
+ * field of struct st7703 and re-apply the full calibration sequence.
+ */
+static ssize_t st7703_calib_write(struct st7703 *ctx, void *field,
+				  size_t expected,
+				  const char __user *ubuf, size_t count)
 {
-	u8 payload[34];
+	u8 staged[ST7703_GAMMA_LEN];
 	int ret;
 
-	if (expected > sizeof(payload))
+	if (expected > sizeof(staged))
 		return -EINVAL;
 	if (count != expected)
 		return -EINVAL;
 
-	if (copy_from_user(payload, ubuf, expected))
+	if (copy_from_user(staged, ubuf, expected))
 		return -EFAULT;
 
-	ret = st7703_push_dcs(ctx, cmd, payload, expected);
+	mutex_lock(&ctx->calib_lock);
+	memcpy(field, staged, expected);
+	ret = st7703_apply_calibration_locked(ctx);
+	mutex_unlock(&ctx->calib_lock);
 	if (ret < 0)
 		return ret;
 
@@ -769,22 +796,28 @@ static ssize_t st7703_tune_write(struct st7703 *ctx, u8 cmd, size_t expected,
 static ssize_t gamma_write(struct file *f, const char __user *ubuf,
 			   size_t count, loff_t *ppos)
 {
-	return st7703_tune_write(f->private_data, ST7703_CMD_SETGAMMA, 34,
-				 ubuf, count);
+	struct st7703 *ctx = f->private_data;
+
+	return st7703_calib_write(ctx, ctx->gamma, sizeof(ctx->gamma),
+				  ubuf, count);
 }
 
 static ssize_t bgp_write(struct file *f, const char __user *ubuf,
 			 size_t count, loff_t *ppos)
 {
-	return st7703_tune_write(f->private_data, ST7703_CMD_SETBGP, 2,
-				 ubuf, count);
+	struct st7703 *ctx = f->private_data;
+
+	return st7703_calib_write(ctx, ctx->bgp, sizeof(ctx->bgp),
+				  ubuf, count);
 }
 
 static ssize_t vcom_write(struct file *f, const char __user *ubuf,
 			  size_t count, loff_t *ppos)
 {
-	return st7703_tune_write(f->private_data, ST7703_CMD_SETVCOM, 2,
-				 ubuf, count);
+	struct st7703 *ctx = f->private_data;
+
+	return st7703_calib_write(ctx, ctx->vcom, sizeof(ctx->vcom),
+				  ubuf, count);
 }
 
 static const struct file_operations gamma_fops = {
@@ -892,6 +925,7 @@ static int st7703_probe(struct mipi_dsi_device *dsi)
 
 	ctx->dev = dev;
 	ctx->desc = of_device_get_match_data(dev);
+	mutex_init(&ctx->calib_lock);
 
 	dsi->mode_flags = ctx->desc->mode_flags;
 	dsi->format = ctx->desc->format;
