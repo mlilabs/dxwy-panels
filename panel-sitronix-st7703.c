@@ -58,11 +58,15 @@
 #define ST7703_CMD_SETGIP2	 0xEA
 #define ST7703_CMD_SETIO	 0xC7
 #define ST7703_CMD_SETCABC	 0xC8
+#define ST7703_CMD_DGC_R	 0xCD
+#define ST7703_CMD_DGC_G	 0xCE
+#define ST7703_CMD_DGC_B	 0xCF
 #define ST7703_CMD_UNKNOWN_EF	 0xEF
 
 #define ST7703_GAMMA_LEN	34
 #define ST7703_BGP_LEN		2
 #define ST7703_VCOM_LEN		2
+#define ST7703_DGC_LEN		33
 
 struct st7703 {
 	struct device *dev;
@@ -81,6 +85,23 @@ struct st7703 {
 	u8 gamma[ST7703_GAMMA_LEN];
 	u8 bgp[ST7703_BGP_LEN];
 	u8 vcom[ST7703_VCOM_LEN];
+
+	/* Digital Gamma Correction (per-channel 33-point 8-bit LUTs).
+	 * Input control points are V0, V8, V16, ..., V240, V248, V255.
+	 * The chip interpolates between entries and outputs 10-bit data
+	 * to the dithering / source driver stage. The DGC_EN bit lives
+	 * in parameter 1 of DGC_R (0xCD); we only store the 33 LUT bytes
+	 * here and prepend the enable bit at write time.
+	 *
+	 * dgc_configured is set as soon as anything (panel descriptor, DT
+	 * override, or a debugfs write) has supplied a non-default state.
+	 * If it stays false the driver does not touch the DGC registers
+	 * at all, preserving the chip's power-on defaults. */
+	bool dgc_configured;
+	bool dgc_enabled;
+	u8 dgc_r[ST7703_DGC_LEN];
+	u8 dgc_g[ST7703_DGC_LEN];
+	u8 dgc_b[ST7703_DGC_LEN];
 };
 
 struct st7703_panel_desc {
@@ -93,6 +114,13 @@ struct st7703_panel_desc {
 	u8 gamma[ST7703_GAMMA_LEN];
 	u8 bgp[ST7703_BGP_LEN];
 	u8 vcom[ST7703_VCOM_LEN];
+
+	/* Optional descriptor-level DGC defaults. If has_dgc is false,
+	 * the driver falls back to an identity LUT and DGC stays off. */
+	bool has_dgc;
+	u8 dgc_r[ST7703_DGC_LEN];
+	u8 dgc_g[ST7703_DGC_LEN];
+	u8 dgc_b[ST7703_DGC_LEN];
 };
 
 static inline struct st7703 *panel_to_st7703(struct drm_panel *panel)
@@ -603,6 +631,8 @@ static int st7703_unprepare(struct drm_panel *panel)
 	return 0;
 }
 
+static int st7703_apply_dgc_locked(struct st7703 *ctx);
+
 static int st7703_prepare(struct drm_panel *panel)
 {
 	struct st7703 *ctx = panel_to_st7703(panel);
@@ -642,6 +672,25 @@ static int st7703_prepare(struct drm_panel *panel)
 	ret = ctx->desc->init_sequence(ctx);
 	if (ret < 0) {
 		dev_err(ctx->dev, "Panel init sequence failed: %d\n", ret);
+		goto disable_iovcc;
+	}
+
+	/*
+	 * Apply Digital Gamma Correction only if it has actually been
+	 * configured. The chip resets DGC state on every power cycle, so
+	 * we must re-upload after each init sequence; but if nothing has
+	 * supplied a LUT (no descriptor default, no DT override, no
+	 * debugfs write), we leave the DGC registers at their power-on
+	 * defaults to keep the previous behavior unchanged.
+	 */
+	mutex_lock(&ctx->calib_lock);
+	if (ctx->dgc_configured)
+		ret = st7703_apply_dgc_locked(ctx);
+	else
+		ret = 0;
+	mutex_unlock(&ctx->calib_lock);
+	if (ret < 0) {
+		dev_err(ctx->dev, "DGC apply failed: %d\n", ret);
 		goto disable_iovcc;
 	}
 
@@ -765,6 +814,45 @@ static int st7703_apply_calibration_locked(struct st7703 *ctx)
 }
 
 /*
+ * Upload the current per-channel DGC LUTs and the DGC_EN bit.
+ *
+ * DGC_R (0xCD) takes 34 parameters: parameter 1 carries DGC_EN in bit 0
+ * (other bits reserved), parameters 2..34 carry the 33-entry red LUT.
+ * DGC_G (0xCE) and DGC_B (0xCF) each take a flat 33-entry LUT.
+ *
+ * This must be called with calib_lock held.
+ */
+static int st7703_apply_dgc_locked(struct st7703 *ctx)
+{
+	u8 buf[1 + ST7703_DGC_LEN];
+	int ret;
+
+	buf[0] = ctx->dgc_enabled ? 0x01 : 0x00;
+	memcpy(buf + 1, ctx->dgc_r, ST7703_DGC_LEN);
+	ret = st7703_dcs_write(ctx, ST7703_CMD_DGC_R, buf, sizeof(buf));
+	if (ret < 0) {
+		dev_err(ctx->dev, "DGC_R write failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = st7703_dcs_write(ctx, ST7703_CMD_DGC_G,
+			       ctx->dgc_g, ST7703_DGC_LEN);
+	if (ret < 0) {
+		dev_err(ctx->dev, "DGC_G write failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = st7703_dcs_write(ctx, ST7703_CMD_DGC_B,
+			       ctx->dgc_b, ST7703_DGC_LEN);
+	if (ret < 0) {
+		dev_err(ctx->dev, "DGC_B write failed: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+/*
  * Stage a new calibration buffer from userspace into the corresponding
  * field of struct st7703 and re-apply the full calibration sequence.
  */
@@ -820,6 +908,82 @@ static ssize_t vcom_write(struct file *f, const char __user *ubuf,
 				  ubuf, count);
 }
 
+/*
+ * Stage a new DGC LUT for one channel and re-upload all three LUTs plus
+ * the enable bit. Each write must be exactly ST7703_DGC_LEN (33) bytes.
+ */
+static ssize_t st7703_dgc_write(struct st7703 *ctx, u8 *field,
+				const char __user *ubuf, size_t count)
+{
+	u8 staged[ST7703_DGC_LEN];
+	int ret;
+
+	if (count != ST7703_DGC_LEN)
+		return -EINVAL;
+
+	if (copy_from_user(staged, ubuf, ST7703_DGC_LEN))
+		return -EFAULT;
+
+	mutex_lock(&ctx->calib_lock);
+	memcpy(field, staged, ST7703_DGC_LEN);
+	ctx->dgc_configured = true;
+	ret = st7703_apply_dgc_locked(ctx);
+	mutex_unlock(&ctx->calib_lock);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+
+static ssize_t dgc_r_write(struct file *f, const char __user *ubuf,
+			   size_t count, loff_t *ppos)
+{
+	struct st7703 *ctx = f->private_data;
+
+	return st7703_dgc_write(ctx, ctx->dgc_r, ubuf, count);
+}
+
+static ssize_t dgc_g_write(struct file *f, const char __user *ubuf,
+			   size_t count, loff_t *ppos)
+{
+	struct st7703 *ctx = f->private_data;
+
+	return st7703_dgc_write(ctx, ctx->dgc_g, ubuf, count);
+}
+
+static ssize_t dgc_b_write(struct file *f, const char __user *ubuf,
+			   size_t count, loff_t *ppos)
+{
+	struct st7703 *ctx = f->private_data;
+
+	return st7703_dgc_write(ctx, ctx->dgc_b, ubuf, count);
+}
+
+static int dgc_enable_get(void *data, u64 *val)
+{
+	struct st7703 *ctx = data;
+
+	*val = ctx->dgc_enabled ? 1 : 0;
+	return 0;
+}
+
+static int dgc_enable_set(void *data, u64 val)
+{
+	struct st7703 *ctx = data;
+	int ret;
+
+	mutex_lock(&ctx->calib_lock);
+	ctx->dgc_enabled = !!val;
+	ctx->dgc_configured = true;
+	ret = st7703_apply_dgc_locked(ctx);
+	mutex_unlock(&ctx->calib_lock);
+
+	return ret;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(dgc_enable_fops, dgc_enable_get, dgc_enable_set,
+			"%llu\n");
+
 static const struct file_operations gamma_fops = {
 	.owner = THIS_MODULE,
 	.open  = simple_open,
@@ -841,6 +1005,27 @@ static const struct file_operations vcom_fops = {
 	.llseek = noop_llseek,
 };
 
+static const struct file_operations dgc_r_fops = {
+	.owner = THIS_MODULE,
+	.open  = simple_open,
+	.write = dgc_r_write,
+	.llseek = noop_llseek,
+};
+
+static const struct file_operations dgc_g_fops = {
+	.owner = THIS_MODULE,
+	.open  = simple_open,
+	.write = dgc_g_write,
+	.llseek = noop_llseek,
+};
+
+static const struct file_operations dgc_b_fops = {
+	.owner = THIS_MODULE,
+	.open  = simple_open,
+	.write = dgc_b_write,
+	.llseek = noop_llseek,
+};
+
 static void st7703_debugfs_init(struct st7703 *ctx)
 {
 	ctx->debugfs = debugfs_create_dir(DRV_NAME, NULL);
@@ -850,6 +1035,11 @@ static void st7703_debugfs_init(struct st7703 *ctx)
 	debugfs_create_file("gamma", 0200, ctx->debugfs, ctx, &gamma_fops);
 	debugfs_create_file("bgp",   0200, ctx->debugfs, ctx, &bgp_fops);
 	debugfs_create_file("vcom",  0200, ctx->debugfs, ctx, &vcom_fops);
+	debugfs_create_file("dgc_r", 0200, ctx->debugfs, ctx, &dgc_r_fops);
+	debugfs_create_file("dgc_g", 0200, ctx->debugfs, ctx, &dgc_g_fops);
+	debugfs_create_file("dgc_b", 0200, ctx->debugfs, ctx, &dgc_b_fops);
+	debugfs_create_file("dgc_enable", 0600, ctx->debugfs, ctx,
+			    &dgc_enable_fops);
 }
 
 static void st7703_debugfs_remove(struct st7703 *ctx)
@@ -888,6 +1078,18 @@ static int st7703_load_calibration(struct st7703 *ctx)
 	memcpy(ctx->bgp,   ctx->desc->bgp,   sizeof(ctx->bgp));
 	memcpy(ctx->vcom,  ctx->desc->vcom,  sizeof(ctx->vcom));
 
+	/* DGC defaults: descriptor table if provided. Otherwise leave the
+	 * LUTs zero-initialised; they will not be uploaded unless
+	 * dgc_configured becomes true via DT or debugfs. */
+	ctx->dgc_enabled = false;
+	ctx->dgc_configured = false;
+	if (ctx->desc->has_dgc) {
+		memcpy(ctx->dgc_r, ctx->desc->dgc_r, ST7703_DGC_LEN);
+		memcpy(ctx->dgc_g, ctx->desc->dgc_g, ST7703_DGC_LEN);
+		memcpy(ctx->dgc_b, ctx->desc->dgc_b, ST7703_DGC_LEN);
+		ctx->dgc_configured = true;
+	}
+
 	/* Apply DT overrides on top, if any. */
 	ret = st7703_read_u8_override(ctx->dev, "panel,gamma",
 				      ctx->gamma, sizeof(ctx->gamma));
@@ -903,6 +1105,35 @@ static int st7703_load_calibration(struct st7703 *ctx)
 				      ctx->vcom, sizeof(ctx->vcom));
 	if (ret < 0)
 		return ret;
+
+	if (of_find_property(ctx->dev->of_node, "panel,dgc-r", NULL)) {
+		ret = st7703_read_u8_override(ctx->dev, "panel,dgc-r",
+					      ctx->dgc_r, ST7703_DGC_LEN);
+		if (ret < 0)
+			return ret;
+		ctx->dgc_configured = true;
+	}
+
+	if (of_find_property(ctx->dev->of_node, "panel,dgc-g", NULL)) {
+		ret = st7703_read_u8_override(ctx->dev, "panel,dgc-g",
+					      ctx->dgc_g, ST7703_DGC_LEN);
+		if (ret < 0)
+			return ret;
+		ctx->dgc_configured = true;
+	}
+
+	if (of_find_property(ctx->dev->of_node, "panel,dgc-b", NULL)) {
+		ret = st7703_read_u8_override(ctx->dev, "panel,dgc-b",
+					      ctx->dgc_b, ST7703_DGC_LEN);
+		if (ret < 0)
+			return ret;
+		ctx->dgc_configured = true;
+	}
+
+	if (of_property_read_bool(ctx->dev->of_node, "panel,dgc-enable")) {
+		ctx->dgc_enabled = true;
+		ctx->dgc_configured = true;
+	}
 
 	return 0;
 }
